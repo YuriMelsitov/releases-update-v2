@@ -4,14 +4,14 @@
 Automatic Confluence update from Slack release posts
 - English output
 - Analyzes channel messages AND threads
-- Parses announcements (name, version, platform, rollout), build cards, and timeline cues
-- Extended time window default: 30 days (override via LOOKBACK_DAYS)
-- Better detection for Dominoes / Block Tok / Number Match / Spades with abbreviations
-- NEW: If root lacks app name, infer it from thread replies (App:/Game:/This is ... or single-name line)
+- Parses announcements, build cards, timeline cues
+- 30-day window by default (override via LOOKBACK_DAYS)
+- Robust app-name inference from thread replies (explicit tags, abbreviations, single-line names)
+- Drops entries without a reliable app name to avoid garbage titles
 
-Requires env:
+Env:
   SLACK_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN, ATLASSIAN_CLOUD_ID, CONFLUENCE_PAGE_ID
-Optional env:
+Optional:
   SLACK_CHANNEL_ID (defaults to C033MFEDQ2C)
   LOOKBACK_DAYS (defaults to 30)
 """
@@ -32,16 +32,15 @@ class ReleaseTracker:
     SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
     HASH_TAG_RE = re.compile(r"(?:^|\s)#\S+")
     BULLET_DOT_RE = re.compile(r"^\s*[•\-\*]\s*")
-    # Versions like 1.2.3 or 12.3.45
+
     VERSION_ANY_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
-    # "10% → 20%" or "10% -> 20%"
     PERCENT_ARROW_RE = re.compile(r"(\d+%)\s*(?:→|->)\s*(\d+%)")
-    # “latest version of Klondike Solitaire (5.0.1) is ready for rollout to 10% of users on Android”
+
     ANNOUNCE_RE = re.compile(
         r"latest version of\s+(?P<name>.+?)\s*\(\s*(?P<version>\d+\.\d+\.\d+)\s*\)\s*is ready for rollout to\s*(?P<percent>\d+)%\s+of users on\s+(?P<platform>\w+)",
         re.IGNORECASE
     )
-    # Extra patterns (inline variants, KV pairs)
+
     NAME_LINE_RE = re.compile(r"^\s*(?P<name>[^:()]+?)(?:\s*\([^)]+\))?\s*$")
     INLINE_NAME_VERSION_RE = re.compile(
         r"^\s*(?P<name>.+?)\s*[-–:|]\s*Version[: ]\s*(?P<version>\d+\.\d+\.\d+)\b",
@@ -56,11 +55,11 @@ class ReleaseTracker:
 
     # Explicit “manual tag” patterns inside replies
     APP_EXPLICIT_RE = re.compile(
-        r"\b(?:app|application|game)\s*[:=\-]\s*(?P<name>[A-Za-z][A-Za-z0-9 +()&'./-]{2,60})\b",
+        r"\b(?:app|application|game|project|title)\s*[:=\-]\s*(?P<name>[A-Za-z][A-Za-z0-9 +()&'./-]{2,60})\b",
         re.IGNORECASE
     )
     THIS_IS_RE = re.compile(
-        r"\bthis\s+is\s+(?P<name>[A-Za-z][A-Za-z0-9 +()&'./-]{2,60})\b",
+        r"\b(?:this\s+is|it\s+is|it\'s)\s+(?P<name>[A-Za-z][A-Za-z0-9 +()&'./-]{2,60})\b",
         re.IGNORECASE
     )
 
@@ -68,10 +67,17 @@ class ReleaseTracker:
     STOPWORDS = {
         'thanks', 'thx', 'ok', 'okay', 'done', 'approved', 'approve', 'team', 'please', 'pls',
         'today', 'later', 'prod', 'production', 'build', 'ready', 'release', 'version',
-        'push', 'green-light', 'greenlight', 'check', 'checked', 'qa', 'rollout', 'rolling'
+        'push', 'green-light', 'greenlight', 'check', 'checked', 'qa', 'rollout', 'rolling',
+        'status', 'published', 'platform'
     }
 
-    # App hints: canonical name -> regex to match anywhere in thread (case-insensitive)
+    # Abbreviation map and app hints
+    ABBR_MAP = {
+        'DMN': 'Dominoes',
+        'NM': 'Number Match',
+        'SPD': 'Spades',
+        'BTK': 'Block Tok',
+    }
     APP_HINTS = [
         ("Dominoes", r"\bDominoes\b|\bDMN\b"),
         ("Number Match", r"\bNumber\s*Match\b|\bNM\b"),
@@ -81,33 +87,28 @@ class ReleaseTracker:
     ]
 
     def __init__(self):
-        # --- env (keep your variable names) ---
-        self.slack_token = os.environ['SLACK_TOKEN']              # xoxb-...
+        self.slack_token = os.environ['SLACK_TOKEN']
         self.atlassian_email = os.environ['ATLASSIAN_EMAIL']
         self.atlassian_token = os.environ['ATLASSIAN_API_TOKEN']
         self.cloud_id = os.environ['ATLASSIAN_CLOUD_ID']
         self.page_id = os.environ['CONFLUENCE_PAGE_ID']
 
-        # Slack channel id (your #npc_releases). Can override via SLACK_CHANNEL_ID if needed.
         self.channel_id = os.getenv('SLACK_CHANNEL_ID', 'C033MFEDQ2C')
-
-        # Time window
         self.lookback_days = int(os.getenv('LOOKBACK_DAYS', '30'))
 
     # ---------- Slack helpers ----------
     @staticmethod
     def _clean_slack_text(text: str) -> str:
-        """Convert Slack markup to plain text and remove noise."""
         if not text:
             return ""
         t = text
-        t = ReleaseTracker.SLACK_LINK_RE.sub(lambda m: m.group(2), t)        # <url|label> -> label
-        t = ReleaseTracker.SLACK_PLAIN_LINK_RE.sub(lambda m: m.group(1), t)  # <url> -> url
-        t = ReleaseTracker.SLACK_SUBTEAM_RE.sub("", t)                       # <!subteam^...>
-        t = ReleaseTracker.SLACK_SPECIAL_RE.sub("", t)                       # <!here>, <!channel>, <!everyone>
-        t = ReleaseTracker.SLACK_MENTION_RE.sub("", t)                       # <@U123> -> ""
+        t = ReleaseTracker.SLACK_LINK_RE.sub(lambda m: m.group(2), t)
+        t = ReleaseTracker.SLACK_PLAIN_LINK_RE.sub(lambda m: m.group(1), t)
+        t = ReleaseTracker.SLACK_SUBTEAM_RE.sub("", t)
+        t = ReleaseTracker.SLACK_SPECIAL_RE.sub("", t)
+        t = ReleaseTracker.SLACK_MENTION_RE.sub("", t)
         t = t.replace("@here", "").replace("@channel", "")
-        t = ReleaseTracker.HASH_TAG_RE.sub("", t)                            # remove #tags like #npc_releases
+        t = ReleaseTracker.HASH_TAG_RE.sub("", t)
         t = re.sub(r"\s+", " ", t).strip()
         return t
 
@@ -121,11 +122,9 @@ class ReleaseTracker:
         return data
 
     def get_slack_messages_with_threads(self) -> List[Dict[str, Any]]:
-        """Fetch last N days of channel messages; attach replies to thread roots."""
         print(f"📥 Fetching Slack messages + threads ({self.lookback_days} days)...")
         oldest_ts = (datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).timestamp()
 
-        # channel history (paginate)
         all_msgs: List[Dict[str, Any]] = []
         cursor = None
         while True:
@@ -139,13 +138,10 @@ class ReleaseTracker:
             if not cursor:
                 break
 
-        # Attach replies for thread roots
         for m in all_msgs:
             if m.get('thread_ts') and m.get('thread_ts') == m.get('ts'):
                 rep_data = self._slack_get('conversations.replies', {
-                    'channel': self.channel_id,
-                    'ts': m['ts'],
-                    'limit': 200
+                    'channel': self.channel_id, 'ts': m['ts'], 'limit': 200
                 })
                 replies = rep_data.get('messages', [])
                 m['_replies'] = replies[1:] if replies and replies[0].get('ts') == m.get('ts') else replies
@@ -153,70 +149,84 @@ class ReleaseTracker:
         print(f"✅ Got {len(all_msgs)} messages")
         return all_msgs
 
-    # ---------- App inference ----------
+    # ---------- App normalization & inference ----------
+    @classmethod
+    def _normalize_app_candidate(cls, name: str) -> Optional[str]:
+        if not name:
+            return None
+        # strip code/bold/italic wrappers and punctuation clutter
+        n = name.strip()
+        n = re.sub(r"^[`*_~\s]+|[`*_~\s]+$", "", n)  # leading/trailing decorators
+        n = re.sub(r"^[\.,;:|/\\\-–—\[\]{}()]+|[\.,;:|/\\\-–—\[\]{}()]+$", "", n).strip()
+        # map abbreviations exactly
+        if n.upper() in cls.ABBR_MAP:
+            return cls.ABBR_MAP[n.upper()]
+        # "Dominoes (DMN)" -> Dominoes
+        m = re.match(r"^([A-Za-z][A-Za-z0-9 +&'./-]{2,60})\s*\(([A-Za-z0-9]{2,5})\)$", n)
+        if m:
+            return m.group(1).strip()
+        # must contain at least two letters total
+        if len(re.findall(r"[A-Za-z]", n)) < 2:
+            return None
+        # avoid stopwords-only
+        if n.lower() in cls.STOPWORDS:
+            return None
+        # avoid generic heads
+        if re.match(r"^(Build|APP|Application|Game|Approved|Approve|Status|Platform|Published)\b", n, flags=re.I):
+            return None
+        return n
+
     @classmethod
     def _infer_app_from_text(cls, text: str) -> str:
         if not text:
             return ""
+        # direct hints
         for canonical, pattern in cls.APP_HINTS:
             if re.search(pattern, text, flags=re.I):
                 return canonical
+        # pure abbreviations inside text
+        for abbr, full in cls.ABBR_MAP.items():
+            if re.search(rf"\b{abbr}\b", text, flags=re.I):
+                return full
         return ""
 
     @classmethod
     def _extract_explicit_app_from_text(cls, text: str) -> Optional[str]:
-        """Try 'App:/Game:/This is ...' or a single-line likely app name."""
         if not text:
             return None
-        # App:/Game:
+        # App:/Game:/Project:/Title:
         mm = cls.APP_EXPLICIT_RE.search(text)
         if mm:
-            name = mm.group('name').strip()
-            # Filter out obvious junk
-            if name.lower() not in cls.STOPWORDS:
-                return name
-
-        # This is <Name>
+            n = cls._normalize_app_candidate(mm.group('name'))
+            if n:
+                return n
+        # This is / It is / It's
         mm2 = cls.THIS_IS_RE.search(text)
         if mm2:
-            name = mm2.group('name').strip()
-            if name.lower() not in cls.STOPWORDS:
-                return name
-
-        # Single-line only-a-name candidate (avoid stopwords)
+            n = cls._normalize_app_candidate(mm2.group('name'))
+            if n:
+                return n
+        # Single-line likely app/abbr
         line = text.strip()
         if "\n" not in line:
-            clean = re.sub(r"[\s·•\-–—|:]+", " ", line).strip()
-            if 2 <= len(clean) <= 60 and clean.lower() not in cls.STOPWORDS:
-                # avoid generic words like Build/APP
-                if not re.match(r"^(Build|APP|Application|Game|Approved|Approve)\b", clean, flags=re.I):
-                    # require at least one letter
-                    if re.search(r"[A-Za-z]", clean):
-                        return clean
-
+            n = cls._normalize_app_candidate(line)
+            if n:
+                return n
         return None
 
     # ---------- Parsing ----------
     def _parse_release_from_text(self, text: str) -> Dict[str, Any]:
-        """Parse a single message into release dict (announcement/build card + generic KV + inline)."""
         raw = text or ""
         s = self._clean_slack_text(raw)
 
         res: Dict[str, Any] = {
-            'app': None,
-            'version': None,
-            'build': None,
-            'platform': None,
-            'status': None,
-            'published': None,
-            'rollout': None,
-            'initial_rollout': None,
-            'current_rollout': None,
-            'key_changes': [],
-            'timeline': [],
+            'app': None, 'version': None, 'build': None, 'platform': None,
+            'status': None, 'published': None, 'rollout': None,
+            'initial_rollout': None, 'current_rollout': None,
+            'key_changes': [], 'timeline': [],
         }
 
-        # 1) “latest version of <Name> (x.y.z) ... on Android”
+        # 1) explicit announcement
         m = self.ANNOUNCE_RE.search(s)
         if m:
             res['app'] = m.group('name').strip()
@@ -227,7 +237,7 @@ class ReleaseTracker:
             res['status'] = "Ready for rollout"
             return res
 
-        # 2) Inline: "Spades — Version: 2.5.3 ..."
+        # 2) inline "Name — Version: x.y.z"
         for ln in s.splitlines():
             im = self.INLINE_NAME_VERSION_RE.match(ln.strip())
             if im:
@@ -235,30 +245,25 @@ class ReleaseTracker:
                 res['version'] = im.group('version').strip()
                 break
 
-        # 3) Generic KV lines (Version/Build/Platform/Status/Rollout + Key Changes bullets)
+        # 3) KV pairs + bullet changes
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
         for i, l in enumerate(lines):
             m_ver = self.ANY_VERSION_KV_RE.match(l)
             if m_ver:
                 res['version'] = res['version'] or m_ver.group('version')
-
             m_build = self.ANY_BUILD_KV_RE.match(l)
             if m_build and not res.get('build'):
                 res['build'] = self._clean_slack_text(m_build.group('build')).lstrip('#')
-
             m_pl = self.ANY_PLATFORM_KV_RE.match(l)
             if m_pl and not res.get('platform'):
                 res['platform'] = self._clean_slack_text(m_pl.group('platform'))
-
             m_stat = self.STATUS_KV_RE.match(l)
             if m_stat:
                 res['status'] = self._clean_slack_text(m_stat.group('status'))
-
             m_roll = self.ROLLOUT_KV_RE.match(l)
             if m_roll:
                 res['current_rollout'] = self._clean_slack_text(m_roll.group('rollout'))
 
-            # Recent/Key Changes bullets
             if l.lower().startswith('recent changes') or l.lower().startswith('key changes'):
                 j = i + 1
                 while j < len(lines) and (self.BULLET_DOT_RE.match(lines[j]) or lines[j].startswith('•')):
@@ -267,13 +272,13 @@ class ReleaseTracker:
                         res['key_changes'].append(self._clean_slack_text(item))
                     j += 1
 
-        # 4) Platform from phrase "on Android/iOS" if not explicitly set
+        # 4) platform "on Android/iOS"
         if not res.get('platform'):
             mplat = self.ON_PLATFORM_RE.search(s)
             if mplat:
                 res['platform'] = mplat.group(1)
 
-        # 5) If app missing, try line above first "Version:" line
+        # 5) name from line above Version:
         if not res.get('app'):
             try:
                 idx_version = next(i for i, l in enumerate(lines) if self.ANY_VERSION_KV_RE.match(l))
@@ -283,16 +288,20 @@ class ReleaseTracker:
                 candidate = self._clean_slack_text(lines[idx_version - 1])
                 mname = self.NAME_LINE_RE.match(candidate)
                 if mname:
-                    res['app'] = mname.group('name').strip()
+                    n = self._normalize_app_candidate(mname.group('name'))
+                    if n:
+                        res['app'] = n
 
-        # 6) If still no app, try head line like "NM (Spades)"
+        # 6) head line like "NM (Spades)"
         if not res.get('app') and lines:
             head = self._clean_slack_text(lines[0])
             mname = self.NAME_LINE_RE.match(head)
             if mname and not re.match(r"^(Build|APP)\b", head, flags=re.I):
-                res['app'] = mname.group('name').strip()
+                n = self._normalize_app_candidate(mname.group('name'))
+                if n:
+                    res['app'] = n
 
-        # 7) Status heuristics if still missing
+        # 7) status heuristics
         lower = s.lower()
         if not res.get('status'):
             if 'being rolled back' in lower or 'roll back' in lower:
@@ -308,20 +317,16 @@ class ReleaseTracker:
             else:
                 res['status'] = 'Unknown'
 
-        # 8) As a last resort, infer app from hints inside this message
+        # 8) final fallbacks (hints / any x.y.z)
         if not res.get('app'):
             res['app'] = self._infer_app_from_text(s) or res.get('app')
-
-        # 9) If still no version, try any x.y.z in message
         if not res.get('version'):
             mver = self.VERSION_ANY_RE.search(s)
             if mver:
                 res['version'] = mver.group(1)
-
         return res
 
     def _merge_replies_into_release(self, base: Dict[str, Any], replies: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Enrich release with info parsed from thread replies (build card, timeline, explicit KV, app/version fallback)."""
         joined_plain = []
         explicit_app: Optional[str] = None
 
@@ -330,13 +335,13 @@ class ReleaseTracker:
             txt = self._clean_slack_text(txt_raw)
             joined_plain.append(txt)
 
-            # Look for explicit app markers first
+            # explicit app markers
             if not explicit_app:
                 ea = self._extract_explicit_app_from_text(txt)
                 if ea:
                     explicit_app = ea
 
-            # Build card enrichment
+            # build card enrichment
             if "Build Version:" in txt_raw or "Build Number:" in txt_raw or "Recent changes:" in txt_raw:
                 lines = [l.strip() for l in txt_raw.splitlines()]
                 for i, l in enumerate(lines):
@@ -354,14 +359,14 @@ class ReleaseTracker:
                                 base.setdefault('key_changes', []).append(self._clean_slack_text(item))
                             j += 1
 
-            # Timeline cues
+            # timeline cues
             if re.search(r"\bchecked\b", txt, flags=re.I):
                 base.setdefault('timeline', []).append("Checked by QA")
             if re.search(r"Rolling out the new version", txt, flags=re.I):
                 base['status'] = "Rollout in progress"
                 base.setdefault('timeline', []).append("Rollout started")
 
-            # Explicit status/rollout updates
+            # explicit status/rollout updates
             mm = re.search(r"(Current Status|Current Rollout|Rollout|Status)\s*:\s*(.+)", txt_raw, flags=re.I)
             if mm:
                 key = mm.group(1).lower()
@@ -371,30 +376,29 @@ class ReleaseTracker:
                 else:
                     base['current_rollout'] = val
 
-            # Rollout % anywhere
+            # rollout % anywhere
             if not base.get('rollout'):
                 m_pct = re.search(r'(\d+)%', txt)
                 if m_pct:
                     base['rollout'] = f"{m_pct.group(1)}% staged rollout"
 
-        # Apply explicit app from replies if base has none
+        # apply explicit app or infer from replies (incl. abbreviations)
         if not base.get('app'):
             if explicit_app:
                 base['app'] = explicit_app
             else:
-                # App inference from any reply hints/abbreviations
                 inferred = self._infer_app_from_text(" ".join(joined_plain))
                 if inferred:
                     base['app'] = inferred
                 else:
-                    # As a last resort: single-line name candidates across replies
+                    # scan each reply as a single-line candidate
                     for line in joined_plain:
                         cand = self._extract_explicit_app_from_text(line)
                         if cand:
                             base['app'] = cand
                             break
 
-        # Version inference from any reply if still missing
+        # version from replies if missing
         if not base.get('version'):
             mver = self.VERSION_ANY_RE.search(" ".join(joined_plain))
             if mver:
@@ -403,7 +407,6 @@ class ReleaseTracker:
         return base
 
     def parse_releases(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Extract releases from messages and their threads; keep latest per app+version."""
         print("🔍 Parsing releases from messages + threads...")
         releases: List[Dict[str, Any]] = []
 
@@ -412,33 +415,33 @@ class ReleaseTracker:
             ts = float(msg.get('ts', 0.0))
             root_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
 
-            # Consider thread roots and single posts (ignore in-thread replies here)
             is_thread_root = msg.get('thread_ts') and msg.get('thread_ts') == msg.get('ts')
             is_single = not msg.get('thread_ts')
             if not (is_thread_root or is_single):
                 continue
 
             rel = self._parse_release_from_text(text)
-            # Published date from root message (English date)
             if not rel.get('published'):
                 rel['published'] = root_dt.strftime("%B %d, %Y")
 
-            # Rollout percentage guess from message if not set
             if not rel.get('rollout'):
                 m_pct = re.search(r'(\d+)%', text)
                 if m_pct:
                     rel['rollout'] = f"{m_pct.group(1)}% staged rollout"
 
-            # Merge thread replies
             if is_thread_root and msg.get('_replies'):
                 rel = self._merge_replies_into_release(rel, msg['_replies'])
 
-            # Keep only reasonable releases
-            if (rel.get('version')) or (rel.get('app') and (rel.get('status') or rel.get('key_changes'))):
+            # REQUIRE a valid app name to avoid garbage titles
+            if not rel.get('app'):
+                continue
+
+            # keep reasonable entries
+            if rel.get('version') or rel.get('status') or rel.get('key_changes'):
                 rel['timestamp'] = ts
                 releases.append(rel)
 
-        # Deduplicate: keep the latest per app-version
+        # dedupe by app-version (prefer latest)
         unique: Dict[str, Dict[str, Any]] = {}
         for r in releases:
             key = f"{(r.get('app') or '').strip()}-{(r.get('version') or '').strip()}"
@@ -450,13 +453,12 @@ class ReleaseTracker:
         print(f"✅ Found {len(result)} releases")
         return result
 
-    # ---------- Confluence rendering (EN) ----------
+    # ---------- Confluence rendering ----------
     @staticmethod
     def _li(key: str, val: str) -> str:
         return f"<li><strong>{key}:</strong> {val}</li>"
 
     def generate_confluence_html(self, releases: List[Dict[str, Any]]) -> str:
-        """Create Confluence Storage HTML in English."""
         print("📝 Generating Confluence content (EN)...")
         now = datetime.now(timezone.utc)
         period_from = (now - timedelta(days=self.lookback_days)).strftime("%B %d")
@@ -468,11 +470,9 @@ class ReleaseTracker:
         if not releases:
             html += "<p><em>No releases found in the selected period.</em></p>"
         else:
-            # group by app (sorted for stable order)
             apps: Dict[str, List[Dict[str, Any]]] = {}
             for r in releases:
-                app = r.get('app') or 'Unknown App'
-                apps.setdefault(app, []).append(r)
+                apps.setdefault(r['app'], []).append(r)
 
             for idx, app_name in enumerate(sorted(apps.keys()), 1):
                 app_releases = apps[app_name]
@@ -501,10 +501,8 @@ class ReleaseTracker:
 
                 if len(app_releases) > 1 or latest.get('timeline'):
                     html += "<p><strong>Timeline:</strong></p><ul>"
-                    # thread timeline
                     for t in latest.get('timeline', []):
                         html += f"<li>{t}</li>"
-                    # historical statuses for this app (from other messages)
                     for rel in reversed(app_releases[1:]):
                         pub = rel.get('published') or ''
                         st = rel.get('status') or 'Status update'
@@ -532,14 +530,12 @@ class ReleaseTracker:
 
     # ---------- Confluence update ----------
     def update_confluence(self, content: str):
-        """Update page using Atlassian Cloud REST (storage format)."""
         print("📤 Updating Confluence page...")
         base = f"https://api.atlassian.com/ex/confluence/{self.cloud_id}/wiki"
         url = f"{base}/rest/api/content/{self.page_id}"
         auth = (self.atlassian_email, self.atlassian_token)
         headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
 
-        # Get current version/title
         r = requests.get(url, auth=auth, headers=headers, timeout=30)
         r.raise_for_status()
         current = r.json()
@@ -554,10 +550,7 @@ class ReleaseTracker:
             'type': 'page',
             'title': title,
             'body': {
-                'storage': {
-                    'value': content,
-                    'representation': 'storage'
-                }
+                'storage': {'value': content, 'representation': 'storage'}
             }
         }
         up = requests.put(url, auth=auth, headers=headers, json=payload, timeout=30)
@@ -574,17 +567,17 @@ class ReleaseTracker:
             messages = self.get_slack_messages_with_threads()
             releases = self.parse_releases(messages)
 
-            # small console preview
+            # preview
             if releases:
                 print("\n📊 Releases:")
-                for rel in releases[:8]:
+                for rel in releases[:10]:
                     app = rel.get('app') or 'Unknown'
                     ver = rel.get('version') or '?'
                     ro = rel.get('rollout') or 'N/A'
                     pub = rel.get('published') or ''
                     print(f"  • {app} {ver} — {pub} ({ro})")
-                if len(releases) > 8:
-                    print(f"  ... and {len(releases) - 8} more")
+                if len(releases) > 10:
+                    print(f"  ... and {len(releases) - 10} more")
 
             html = self.generate_confluence_html(releases)
             self.update_confluence(html)
