@@ -25,7 +25,7 @@ class ReleaseTracker:
         """Получить сообщения из Slack за последние 7 дней"""
         print("📥 Получаю сообщения из Slack...")
         
-        seven_days_ago = (datetime.now() - timedelta(days=7)).timestamp()
+        seven_days_ago = (datetime.now() - timedelta(days=14)).timestamp()
         
         url = 'https://slack.com/api/conversations.history'
         headers = {'Authorization': f'Bearer {self.slack_token}'}
