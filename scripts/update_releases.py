@@ -4,12 +4,13 @@
 Automatic Confluence update from Slack release posts
 - English output
 - Analyzes channel messages AND threads
-- Parses announcements, build cards, timeline cues
-- 30-day window by default (override via LOOKBACK_DAYS)
-- Robust app-name inference from thread replies (explicit tags, abbreviations, single-line names)
+- Parses announcements, build cards (Pepe Builder), and timeline cues
+- Robust app-name inference from late thread replies (e.g., "this is Block tok")
+- Understands lines like "Android 1.40.01 rolled out to 20%", "iOS 1.40.01 is live",
+  "10% rolled out!", emojis like :release_20:, and "Build can be submitted to store"
 - Drops entries without a reliable app name to avoid garbage titles
 
-Env:
+Env (same as before):
   SLACK_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN, ATLASSIAN_CLOUD_ID, CONFLUENCE_PAGE_ID
 Optional:
   SLACK_CHANNEL_ID (defaults to C033MFEDQ2C)
@@ -30,12 +31,11 @@ class ReleaseTracker:
     SLACK_SUBTEAM_RE = re.compile(r"<!subteam\^[A-Z0-9]+(?:\|[^>]+)?>")
     SLACK_SPECIAL_RE = re.compile(r"<!(?:here|channel|everyone)>")
     SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
+    SLACK_EMOJI_RE = re.compile(r":[a-z0-9_+-]+:", re.IGNORECASE)  # :android:, :release_20:
     HASH_TAG_RE = re.compile(r"(?:^|\s)#\S+")
     BULLET_DOT_RE = re.compile(r"^\s*[•\-\*]\s*")
 
     VERSION_ANY_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
-    PERCENT_ARROW_RE = re.compile(r"(\d+%)\s*(?:→|->)\s*(\d+%)")
-
     ANNOUNCE_RE = re.compile(
         r"latest version of\s+(?P<name>.+?)\s*\(\s*(?P<version>\d+\.\d+\.\d+)\s*\)\s*is ready for rollout to\s*(?P<percent>\d+)%\s+of users on\s+(?P<platform>\w+)",
         re.IGNORECASE
@@ -53,22 +53,41 @@ class ReleaseTracker:
     STATUS_KV_RE = re.compile(r"^\s*Status\s*:\s*(?P<status>.+?)\s*$", re.IGNORECASE)
     ROLLOUT_KV_RE = re.compile(r"^\s*(?:Rollout|Current Rollout)\s*:\s*(?P<rollout>.+?)\s*$", re.IGNORECASE)
 
-    # Explicit “manual tag” patterns inside replies
-    APP_EXPLICIT_RE = re.compile(
-        r"\b(?:app|application|game|project|title)\s*[:=\-]\s*(?P<name>[A-Za-z][A-Za-z0-9 +()&'./-]{2,60})\b",
+    # Thread-specific lines
+    PLATFORM_VERSION_ROLLED_RE = re.compile(
+        r"\b(?P<platform>Android|iOS|iPadOS)\b\s+(?P<version>\d+\.\d+\.\d+)\b.*?(?:rolled\s+out\s+to\s+(?P<pct>\d+)%)",
         re.IGNORECASE
     )
-    THIS_IS_RE = re.compile(
-        r"\b(?:this\s+is|it\s+is|it\'s)\s+(?P<name>[A-Za-z][A-Za-z0-9 +()&'./-]{2,60})\b",
+    PLATFORM_VERSION_LIVE_RE = re.compile(
+        r"\b(?P<platform>Android|iOS|iPadOS)\b\s+(?P<version>\d+\.\d+\.\d+)\b.*?\bis\s+live\b",
+        re.IGNORECASE
+    )
+    VERSION_ROLLED_RE = re.compile(
+        r"\bVersion\s+(?P<version>\d+\.\d+\.\d+)\b.*?(?:Rolled\s+out\s+to\s+(?P<pct>\d+)%)",
         re.IGNORECASE
     )
 
-    # Stopwords to avoid picking as app names on single-line heuristics
+    # Rollout % from workflow/emoji messages like "10% rolled out!" or ":release_20:"
+    ROLLED_OUT_BANG_RE = re.compile(r"\b(\d+)%\s+rolled\s+out!?$", re.IGNORECASE)
+    RELEASE_EMOJI_RE = re.compile(r":release[_\- ]?(\d+):", re.IGNORECASE)
+
+    # Explicit “manual tag” patterns inside replies
+    APP_EXPLICIT_RE = re.compile(
+        r"\b(?:app|application|game|project|title)\s*[:=\-]\s*(?P<name>[A-Za-z][A-Za-z0-9 +()\[\]&'./-]{2,60})\b",
+        re.IGNORECASE
+    )
+    THIS_IS_RE = re.compile(
+        r"\b(?:this\s+is|it\s+is|it\'s)\s+(?P<name>[A-Za-z][A-Za-z0-9 +()\[\]&'./-]{2,60})\b",
+        re.IGNORECASE
+    )
+    SINGLE_BRACKETED_PLATFORM_RE = re.compile(r"\[(Android|iOS|iPadOS)\]", re.IGNORECASE)
+
+    # Stopwords to avoid picking as app names
     STOPWORDS = {
-        'thanks', 'thx', 'ok', 'okay', 'done', 'approved', 'approve', 'team', 'please', 'pls',
-        'today', 'later', 'prod', 'production', 'build', 'ready', 'release', 'version',
-        'push', 'green-light', 'greenlight', 'check', 'checked', 'qa', 'rollout', 'rolling',
-        'status', 'published', 'platform'
+        'thanks','thx','ok','okay','done','approved','approve','team','please','pls',
+        'today','later','prod','production','build','ready','release','version',
+        'push','green-light','greenlight','check','checked','qa','rollout','rolling',
+        'status','published','platform','live','android','ios','ipados','workflow'
     }
 
     # Abbreviation map and app hints
@@ -78,12 +97,22 @@ class ReleaseTracker:
         'SPD': 'Spades',
         'BTK': 'Block Tok',
     }
+    # lower-case canonical map for title-casing noisy inputs
+    CANONICAL_MAP = {
+        'block tok': 'Block Tok',
+        'dominoes': 'Dominoes',
+        'number match': 'Number Match',
+        'spades': 'Spades',
+        'klondike solitaire': 'Klondike Solitaire',
+        'wordmaker': 'Wordmaker',
+    }
     APP_HINTS = [
         ("Dominoes", r"\bDominoes\b|\bDMN\b"),
         ("Number Match", r"\bNumber\s*Match\b|\bNM\b"),
         ("Spades", r"\bSpades\b|\bSPD\b"),
-        ("Block Tok", r"\bBlock\s*Tok\b|\bBTK\b"),
+        ("Block Tok", r"\bBlock\s*Tok\b|\bBTK\b|\bBlock\s*tok\b"),
         ("Klondike Solitaire", r"\bKlondike(\s+Solitaire)?\b"),
+        ("Wordmaker", r"\bWordmaker\b"),
     ]
 
     def __init__(self):
@@ -107,6 +136,7 @@ class ReleaseTracker:
         t = ReleaseTracker.SLACK_SUBTEAM_RE.sub("", t)
         t = ReleaseTracker.SLACK_SPECIAL_RE.sub("", t)
         t = ReleaseTracker.SLACK_MENTION_RE.sub("", t)
+        t = ReleaseTracker.SLACK_EMOJI_RE.sub("", t)  # drop :emoji:
         t = t.replace("@here", "").replace("@channel", "")
         t = ReleaseTracker.HASH_TAG_RE.sub("", t)
         t = re.sub(r"\s+", " ", t).strip()
@@ -154,25 +184,31 @@ class ReleaseTracker:
     def _normalize_app_candidate(cls, name: str) -> Optional[str]:
         if not name:
             return None
-        # strip code/bold/italic wrappers and punctuation clutter
         n = name.strip()
-        n = re.sub(r"^[`*_~\s]+|[`*_~\s]+$", "", n)  # leading/trailing decorators
-        n = re.sub(r"^[\.,;:|/\\\-–—\[\]{}()]+|[\.,;:|/\\\-–—\[\]{}()]+$", "", n).strip()
+        # strip wrappers and clutter (including leading/trailing brackets/parentheses)
+        n = re.sub(r"^[`*_~\s\[\]()+\-–—|:.,;]+|[`*_~\s\[\]()+\-–—|:.,;]+$", "", n)
+        # drop trailing platform in brackets: "Wordmaker [Android]" -> "Wordmaker"
+        n = re.sub(r"\s*\[(Android|iOS|iPadOS)\]\s*$", "", n, flags=re.I).strip()
         # map abbreviations exactly
         if n.upper() in cls.ABBR_MAP:
             return cls.ABBR_MAP[n.upper()]
-        # "Dominoes (DMN)" -> Dominoes
-        m = re.match(r"^([A-Za-z][A-Za-z0-9 +&'./-]{2,60})\s*\(([A-Za-z0-9]{2,5})\)$", n)
+        # "Name (DMN)" -> Name
+        m = re.match(r"^([A-Za-z][A-Za-z0-9 +&'./-]{2,60})\s*\(([A-Za-z0-9]{2,8})\)$", n)
         if m:
-            return m.group(1).strip()
+            n = m.group(1).strip()
+        # drop trailing generic suffixes like "app"/"game"
+        n = re.sub(r"\s+\b(app|application|game)\b\.?$", "", n, flags=re.I).strip()
+        # canonical lower map
+        low = n.lower()
+        if low in cls.CANONICAL_MAP:
+            n = cls.CANONICAL_MAP[low]
         # must contain at least two letters total
         if len(re.findall(r"[A-Za-z]", n)) < 2:
             return None
-        # avoid stopwords-only
+        # avoid stopwords/generic heads
         if n.lower() in cls.STOPWORDS:
             return None
-        # avoid generic heads
-        if re.match(r"^(Build|APP|Application|Game|Approved|Approve|Status|Platform|Published)\b", n, flags=re.I):
+        if re.match(r"^(Build|APP|Application|Game|Approved|Approve|Status|Platform|Published|Workflow)\b", n, flags=re.I):
             return None
         return n
 
@@ -241,7 +277,7 @@ class ReleaseTracker:
         for ln in s.splitlines():
             im = self.INLINE_NAME_VERSION_RE.match(ln.strip())
             if im:
-                res['app'] = im.group('name').strip()
+                res['app'] = self._normalize_app_candidate(im.group('name').strip())
                 res['version'] = im.group('version').strip()
                 break
 
@@ -292,9 +328,10 @@ class ReleaseTracker:
                     if n:
                         res['app'] = n
 
-        # 6) head line like "NM (Spades)"
+        # 6) head line like "NM (Spades)" or "Wordmaker [Android]"
         if not res.get('app') and lines:
             head = self._clean_slack_text(lines[0])
+            head = re.sub(r"\s*\[(Android|iOS|iPadOS)\]\s*$", "", head, flags=re.I)
             mname = self.NAME_LINE_RE.match(head)
             if mname and not re.match(r"^(Build|APP)\b", head, flags=re.I):
                 n = self._normalize_app_candidate(mname.group('name'))
@@ -335,13 +372,40 @@ class ReleaseTracker:
             txt = self._clean_slack_text(txt_raw)
             joined_plain.append(txt)
 
-            # explicit app markers
-            if not explicit_app:
-                ea = self._extract_explicit_app_from_text(txt)
-                if ea:
-                    explicit_app = ea
+            # explicit app markers (works even if appear late in thread)
+            ea = self._extract_explicit_app_from_text(txt)
+            if ea:
+                explicit_app = ea  # keep last explicit mention to allow late "this is Block tok"
 
-            # build card enrichment
+            # platform/version/rollout lines (Android/iOS 1.40.01 ...)
+            m1 = self.PLATFORM_VERSION_ROLLED_RE.search(txt)
+            if m1:
+                base['platform'] = base.get('platform') or m1.group('platform')
+                base['version'] = base.get('version') or m1.group('version')
+                base['rollout'] = f"{m1.group('pct')}% staged rollout"
+            m2 = self.PLATFORM_VERSION_LIVE_RE.search(txt)
+            if m2:
+                base['platform'] = base.get('platform') or m2.group('platform')
+                base['version'] = base.get('version') or m2.group('version')
+                base['status'] = "In production"
+                base.setdefault('timeline', []).append("Live")
+            m3 = self.VERSION_ROLLED_RE.search(txt)
+            if m3 and not base.get('version'):
+                base['version'] = m3.group('version')
+                if m3.group('pct'):
+                    base['rollout'] = f"{m3.group('pct')}% staged rollout"
+
+            # Rollout % from bang/emoji or short workflow messages
+            b = self.ROLLED_OUT_BANG_RE.search(txt)
+            if b:
+                base['rollout'] = f"{b.group(1)}% staged rollout"
+                base.setdefault('timeline', []).append(f"Rollout in progress ({b.group(1)}%)")
+            e = self.RELEASE_EMOJI_RE.search(txt_raw)
+            if e:
+                base['rollout'] = f"{e.group(1)}% staged rollout"
+                base.setdefault('timeline', []).append(f"Rollout in progress ({e.group(1)}%)")
+
+            # build card enrichment (Pepe Builder)
             if "Build Version:" in txt_raw or "Build Number:" in txt_raw or "Recent changes:" in txt_raw:
                 lines = [l.strip() for l in txt_raw.splitlines()]
                 for i, l in enumerate(lines):
@@ -359,12 +423,15 @@ class ReleaseTracker:
                                 base.setdefault('key_changes', []).append(self._clean_slack_text(item))
                             j += 1
 
-            # timeline cues
+            # timeline cues & approvals
             if re.search(r"\bchecked\b", txt, flags=re.I):
                 base.setdefault('timeline', []).append("Checked by QA")
-            if re.search(r"Rolling out the new version", txt, flags=re.I):
-                base['status'] = "Rollout in progress"
-                base.setdefault('timeline', []).append("Rollout started")
+            if re.search(r"\bgreen\s*light(?:ed)?\b|\bgreen-?light(?:ed)?\b", txt, flags=re.I):
+                base.setdefault('timeline', []).append("Green-lighted")
+                base['status'] = base.get('status') or "Ready for rollout"
+            if re.search(r"can be submitted to store|ready for submission", txt, flags=re.I):
+                base.setdefault('timeline', []).append("Ready for submission")
+                base['status'] = base.get('status') or "Ready for submission"
 
             # explicit status/rollout updates
             mm = re.search(r"(Current Status|Current Rollout|Rollout|Status)\s*:\s*(.+)", txt_raw, flags=re.I)
@@ -376,11 +443,17 @@ class ReleaseTracker:
                 else:
                     base['current_rollout'] = val
 
-            # rollout % anywhere
+            # generic % fallback
             if not base.get('rollout'):
                 m_pct = re.search(r'(\d+)%', txt)
                 if m_pct:
                     base['rollout'] = f"{m_pct.group(1)}% staged rollout"
+
+            # platform from bracket suffix in line (e.g., Wordmaker [Android])
+            if not base.get('platform'):
+                mplat = self.SINGLE_BRACKETED_PLATFORM_RE.search(txt)
+                if mplat:
+                    base['platform'] = mplat.group(1)
 
         # apply explicit app or infer from replies (incl. abbreviations)
         if not base.get('app'):
@@ -391,14 +464,13 @@ class ReleaseTracker:
                 if inferred:
                     base['app'] = inferred
                 else:
-                    # scan each reply as a single-line candidate
                     for line in joined_plain:
                         cand = self._extract_explicit_app_from_text(line)
                         if cand:
                             base['app'] = cand
                             break
 
-        # version from replies if missing
+        # version fallback from replies
         if not base.get('version'):
             mver = self.VERSION_ANY_RE.search(" ".join(joined_plain))
             if mver:
@@ -436,7 +508,6 @@ class ReleaseTracker:
             if not rel.get('app'):
                 continue
 
-            # keep reasonable entries
             if rel.get('version') or rel.get('status') or rel.get('key_changes'):
                 rel['timestamp'] = ts
                 releases.append(rel)
