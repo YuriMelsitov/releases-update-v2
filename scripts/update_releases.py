@@ -105,21 +105,18 @@ class ReleaseTracker:
         print(f"✅ Найдено {len(releases)} релизов")
         return releases
     
-    def generate_confluence_content(self, releases):
-        """Создать контент для Confluence"""
+    def generate_confluence_html(self, releases):
+        """Создать HTML контент для Confluence"""
         print("📝 Генерирую контент...")
         
         today = datetime.now().strftime('%d %B %Y')
         week_ago = (datetime.now() - timedelta(days=7)).strftime('%d %B')
         
-        content = f"""# NPC Releases - Последние 7 дней
-
-## Релизы за период {week_ago} - {today}
-
-"""
+        html = f"<h1>NPC Releases - Последние 7 дней</h1>"
+        html += f"<h2>Релизы за период {week_ago} - {today}</h2>"
         
         if not releases:
-            content += "_Релизов за последние 7 дней не найдено._\n\n"
+            html += "<p><em>Релизов за последние 7 дней не найдено.</em></p>"
         else:
             apps = {}
             for release in releases:
@@ -131,68 +128,82 @@ class ReleaseTracker:
             for idx, (app_name, app_releases) in enumerate(apps.items(), 1):
                 latest = app_releases[0]
                 
-                content += f"### {idx}. {app_name}\n\n"
-                content += f"- **Версия:** {latest['version']}\n"
+                html += f"<h3>{idx}. {app_name}</h3>"
+                html += "<ul>"
+                html += f"<li><strong>Версия:</strong> {latest['version']}</li>"
                 
                 if latest['build']:
-                    content += f"- **Build:** {latest['build']}\n"
+                    html += f"<li><strong>Build:</strong> {latest['build']}</li>"
                 
-                content += f"- **Дата публикации:** {latest['date']} в {latest['time']}\n"
-                content += f"- **Rollout:** {latest['rollout']}\n"
-                content += f"- **Статус:** {latest['status']}\n"
+                html += f"<li><strong>Дата публикации:</strong> {latest['date']} в {latest['time']}</li>"
+                html += f"<li><strong>Rollout:</strong> {latest['rollout']}</li>"
+                html += f"<li><strong>Статус:</strong> {latest['status']}</li>"
+                html += "</ul>"
                 
                 if len(app_releases) > 1:
-                    content += "\n**История:**\n"
+                    html += "<p><strong>История:</strong></p><ul>"
                     for rel in reversed(app_releases):
-                        content += f"- {rel['date']} {rel['time']}: {rel['status']} ({rel['rollout']})\n"
+                        html += f"<li>{rel['date']} {rel['time']}: {rel['status']} ({rel['rollout']})</li>"
+                    html += "</ul>"
                 
-                content += "\n---\n\n"
+                html += "<hr/>"
         
-        content += f"""## Процесс выкатки
-
-Все релизы проходят следующие этапы:
-
-1. Внутреннее тестирование
-2. Проверка команд (SDK, Product, Monetization)
-3. Начальная выкатка 10%
-4. Проверка метрик (crash rates, ARPU, impressions)
-5. Увеличение до 20% при хороших показателях
-6. Постепенная выкатка до 100%
-
----
-
-*Обновлено автоматически: {datetime.now().strftime('%d %B %Y в %H:%M UTC')}*
-"""
+        html += "<h2>Процесс выкатки</h2>"
+        html += "<p>Все релизы проходят следующие этапы:</p>"
+        html += "<ol>"
+        html += "<li>Внутреннее тестирование</li>"
+        html += "<li>Проверка команд (SDK, Product, Monetization)</li>"
+        html += "<li>Начальная выкатка 10%</li>"
+        html += "<li>Проверка метрик (crash rates, ARPU, impressions)</li>"
+        html += "<li>Увеличение до 20% при хороших показателях</li>"
+        html += "<li>Постепенная выкатка до 100%</li>"
+        html += "</ol>"
+        html += "<hr/>"
+        html += f"<p><em>Обновлено автоматически: {datetime.now().strftime('%d %B %Y в %H:%M UTC')}</em></p>"
         
-        return content
+        return html
     
     def update_confluence(self, content):
         """Обновить страницу в Confluence"""
         print("📤 Обновляю Confluence...")
         
-        url = f"https://api.atlassian.com/ex/confluence/{self.cloud_id}/wiki/api/v2/pages/{self.page_id}"
+        # Используем REST API v1 который поддерживает прямой HTML
+        url = f"https://api.atlassian.com/ex/confluence/{self.cloud_id}/wiki/rest/api/content/{self.page_id}"
         auth = (self.atlassian_email, self.atlassian_token)
-        headers = {'Content-Type': 'application/json'}
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
         
-        # Получаем текущую версию
+        # Получаем текущую версию страницы
         response = requests.get(url, auth=auth, headers=headers)
         response.raise_for_status()
         current_page = response.json()
         current_version = current_page.get('version', {}).get('number', 1)
+        title = current_page.get('title', 'NPC Releases')
         
-        # Обновляем
+        # Обновляем страницу
         payload = {
-            'id': self.page_id,
-            'status': 'current',
-            'title': current_page.get('title'),
-            'body': content,
             'version': {
                 'number': current_version + 1,
                 'message': f'Автоматическое обновление {datetime.now().strftime("%Y-%m-%d %H:%M")}'
+            },
+            'type': 'page',
+            'title': title,
+            'body': {
+                'storage': {
+                    'value': content,
+                    'representation': 'storage'
+                }
             }
         }
         
         response = requests.put(url, auth=auth, headers=headers, json=payload)
+        
+        if response.status_code != 200:
+            print(f"Ошибка ответа: {response.status_code}")
+            print(f"Тело ответа: {response.text}")
+        
         response.raise_for_status()
         
         print(f"✅ Обновлено (v{current_version} → v{current_version + 1})")
@@ -202,9 +213,13 @@ class ReleaseTracker:
         print("🚀 Запуск...")
         
         try:
+            # Получить сообщения из Slack
             messages = self.get_slack_messages()
+            
+            # Извлечь релизы
             releases = self.parse_releases(messages)
             
+            # Показать найденные релизы
             if releases:
                 print(f"\n📊 Найденные релизы:")
                 for rel in releases[:5]:
@@ -212,13 +227,18 @@ class ReleaseTracker:
                 if len(releases) > 5:
                     print(f"  ... и еще {len(releases) - 5}")
             
-            content = self.generate_confluence_content(releases)
+            # Сгенерировать HTML контент
+            content = self.generate_confluence_html(releases)
+            
+            # Обновить Confluence
             self.update_confluence(content)
             
             print("\n✅ Готово!")
             
         except Exception as e:
             print(f"\n❌ Ошибка: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise
 
 
